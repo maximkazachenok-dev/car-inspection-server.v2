@@ -4,7 +4,7 @@
 // =====================================================================
 window.APP_CONFIG = {
   // Адрес сервера на Railway + /submit на конце
-  SERVER_URL: 'https://АДРЕС-ВАШЕГО-СЕРВЕРА/submit',
+  SERVER_URL: 'https://web-production-9eace.up.railway.app/submit',
   // Секретный ключ приложения (такой же — в Railway, переменная API_TOKEN)
-  APP_TOKEN: 'ВСТАВЬТЕ-КЛЮЧ'
+  APP_TOKEN: '2ffb5c45b132773f89cc80297f90b993639440697ceced32ef0fb4e44f509a9b'
 };
