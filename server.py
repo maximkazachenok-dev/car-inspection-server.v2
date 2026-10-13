@@ -1,4 +1,5 @@
 """Сервер «Осмотр ТС» v2: принимает осмотры, ведёт строки карточек ТС, шлёт уведомления."""
+import hashlib
 import json
 import os
 import threading
@@ -16,18 +17,23 @@ from supa import Supa, SupaError, make_thumbnail
 from notify import (Telegram, escape_markdown, compress_image, is_valid_image,
                     analyze_photos_with_ai, compare_inspections_with_ai)
 
-BOT_TOKEN = os.environ.get('BOT_TOKEN', '')
-CHAT_ID = os.environ.get('CHAT_ID', '')
-SUPABASE_URL = os.environ.get('SUPABASE_URL', '')
-SUPABASE_KEY = os.environ.get('SUPABASE_KEY', '')
-ANTHROPIC_KEY = os.environ.get('ANTHROPIC_KEY', '')
-API_TOKEN = os.environ.get('API_TOKEN', '')
-TELEGRAM_WEBHOOK_SECRET = os.environ.get('TELEGRAM_WEBHOOK_SECRET', '')
-TELEGRAM_API = os.environ.get('TELEGRAM_API', '')          # только для тестов: подмена адреса Telegram
-PORTAL_URL = os.environ.get('PORTAL_URL', '').rstrip('/')    # адрес сайта, например https://логин.github.io/car-inspection-v2/portal
-APP_TZ = ZoneInfo(os.environ.get('APP_TIMEZONE', 'Europe/Minsk'))
+def env(name, default=''):
+    """Значение переменной без случайных пробелов, переводов строк и кавычек по краям."""
+    return os.environ.get(name, default).strip().strip('"\'').strip()
+
+
+BOT_TOKEN = env('BOT_TOKEN')
+CHAT_ID = env('CHAT_ID')
+SUPABASE_URL = env('SUPABASE_URL').rstrip('/')
+SUPABASE_KEY = env('SUPABASE_KEY')
+ANTHROPIC_KEY = env('ANTHROPIC_KEY')
+API_TOKEN = env('API_TOKEN')
+TELEGRAM_WEBHOOK_SECRET = env('TELEGRAM_WEBHOOK_SECRET')
+TELEGRAM_API = env('TELEGRAM_API')          # только для тестов: подмена адреса Telegram
+PORTAL_URL = env('PORTAL_URL').rstrip('/')    # адрес сайта, например https://логин.github.io/car-inspection-v2/portal
+APP_TZ = ZoneInfo(env('APP_TIMEZONE', 'Europe/Minsk') or 'Europe/Minsk')
 ALLOWED_ORIGINS = [o.strip().rstrip('/').lower() for o in
-                   os.environ.get('ALLOWED_ORIGINS', 'https://maximkazachenok-dev.github.io').split(',')
+                   env('ALLOWED_ORIGINS', 'https://maximkazachenok-dev.github.io').split(',')
                    if o.strip()]
 
 app = Flask(__name__)
@@ -47,7 +53,24 @@ class SessionChanged(Exception):
 
 
 def authorized():
-    return API_TOKEN and request.headers.get('X-App-Token', '') == API_TOKEN
+    return bool(API_TOKEN) and request.headers.get('X-App-Token', '').strip() == API_TOKEN
+
+
+def fingerprint(value):
+    """Короткий отпечаток значения: позволяет сверить ключ, не раскрывая его."""
+    return hashlib.sha256(value.encode()).hexdigest()[:8] if value else None
+
+
+def key_kind(key):
+    if not key:
+        return 'не задан'
+    if key.startswith('sb_secret_'):
+        return 'secret (верно)'
+    if key.startswith('sb_publishable_'):
+        return 'publishable (НЕВЕРНО: нужен Secret key)'
+    if key.startswith('eyJ'):
+        return 'старый ключ JWT'
+    return 'неизвестный формат'
 
 
 def fail(message, status):
@@ -94,6 +117,30 @@ def open_session_for(vehicle_id):
 @app.route('/', methods=['GET'])
 def health():
     return 'OK', 200
+
+
+@app.route('/api/health', methods=['GET'])
+def health_details():
+    """Самопроверка настроек: какие переменные сервер получил. Секреты не показываются."""
+    supabase = 'не проверено'
+    if SUPABASE_URL and SUPABASE_KEY:
+        try:
+            db.select('settings', {'select': 'key', 'limit': '1'})
+            supabase = 'подключено'
+        except SupaError as e:
+            supabase = f'ошибка {e.status}'
+        except Exception as e:
+            supabase = f'нет связи: {type(e).__name__}'
+    return jsonify({
+        'API_TOKEN': {'задан': bool(API_TOKEN), 'длина': len(API_TOKEN), 'отпечаток': fingerprint(API_TOKEN)},
+        'SUPABASE_URL': SUPABASE_URL or 'не задан',
+        'SUPABASE_KEY': key_kind(SUPABASE_KEY),
+        'supabase': supabase,
+        'telegram': 'задан' if BOT_TOKEN and CHAT_ID else 'не задан',
+        'ALLOWED_ORIGINS': ALLOWED_ORIGINS,
+        'PORTAL_URL': PORTAL_URL or 'не задан',
+        'ANTHROPIC_KEY': 'задан' if ANTHROPIC_KEY else 'не задан',
+    })
 
 
 @app.route('/api/directory', methods=['GET'])
