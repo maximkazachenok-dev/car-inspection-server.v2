@@ -7,6 +7,7 @@ import uuid
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
+import anthropic
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_limiter import Limiter
@@ -16,6 +17,7 @@ from sessions import decide, normalize_plate, fmt_km
 from supa import Supa, SupaError, make_thumbnail
 from notify import (Telegram, escape_markdown, compress_image, is_valid_image,
                     analyze_photos_with_ai, compare_inspections_with_ai)
+from assistant import Assistant, AssistantError, analyze_inspection
 
 def env(name, default=''):
     """Значение переменной без случайных пробелов, переводов строк и кавычек по краям."""
@@ -71,6 +73,17 @@ def key_kind(key):
     if key.startswith('eyJ'):
         return 'старый ключ JWT'
     return 'неизвестный формат'
+
+
+def portal_user():
+    """Пользователь сайта по токену входа Supabase из заголовка Authorization."""
+    header = request.headers.get('Authorization', '')
+    token = header[7:].strip() if header.lower().startswith('bearer ') else ''
+    try:
+        return db.auth_user(token)
+    except Exception as e:
+        print(f'Auth check error: {e}')
+        return None
 
 
 def fail(message, status):
@@ -131,6 +144,15 @@ def health_details():
             supabase = f'ошибка {e.status}'
         except Exception as e:
             supabase = f'нет связи: {type(e).__name__}'
+    assistant = 'нет ключа ИИ' if not ANTHROPIC_KEY else 'не проверено'
+    if ANTHROPIC_KEY and supabase == 'подключено':
+        try:
+            db.select('v_last_inspections', {'select': 'id', 'limit': '1'})
+            assistant = 'готов'
+        except SupaError:
+            assistant = 'выполните supabase/002_assistant.sql'
+        except Exception as e:
+            assistant = f'нет связи: {type(e).__name__}'
     return jsonify({
         'API_TOKEN': {'задан': bool(API_TOKEN), 'длина': len(API_TOKEN), 'отпечаток': fingerprint(API_TOKEN)},
         'SUPABASE_URL': SUPABASE_URL or 'не задан',
@@ -140,6 +162,7 @@ def health_details():
         'ALLOWED_ORIGINS': ALLOWED_ORIGINS,
         'PORTAL_URL': PORTAL_URL or 'не задан',
         'ANTHROPIC_KEY': 'задан' if ANTHROPIC_KEY else 'не задан',
+        'помощник': assistant,
     })
 
 
@@ -356,6 +379,64 @@ def notify_background(inspection_id, vehicle, driver, kind, inspected_at, mileag
         print(f'Background error: {e}')
         import traceback
         traceback.print_exc()
+
+
+# ---------------------------------------------------------------------
+# ИИ-помощник сайта
+def assistant_guard():
+    """Ответ с ошибкой, если помощником пользоваться нельзя, иначе None."""
+    if not portal_user():
+        return fail('Сеанс входа истёк. Обновите страницу и войдите заново.', 401)
+    if not ANTHROPIC_KEY:
+        return fail('ИИ не подключён: на сервере не задан ключ ANTHROPIC_KEY.', 503)
+    return None
+
+
+def assistant_failure(e):
+    print(f'Assistant error: {type(e).__name__}: {e}')
+    if isinstance(e, AssistantError):
+        return fail(str(e), 400)
+    if isinstance(e, anthropic.RateLimitError):
+        return fail('ИИ сейчас перегружен. Повторите через минуту.', 429)
+    if isinstance(e, anthropic.AuthenticationError):
+        return fail('Ключ ИИ (ANTHROPIC_KEY) не принят. Проверьте его в настройках Railway.', 502)
+    if isinstance(e, anthropic.APIStatusError) and 'credit' in str(e.message).lower():
+        return fail('На счёте ИИ закончились средства. Пополните баланс в консоли Anthropic.', 502)
+    if isinstance(e, (anthropic.APIStatusError, anthropic.APIConnectionError)):
+        return fail('ИИ не ответил. Повторите вопрос чуть позже.', 502)
+    if isinstance(e, SupaError):
+        return fail('База данных недоступна. Повторите чуть позже.', 502)
+    return fail('Ошибка помощника. Повторите вопрос.', 500)
+
+
+@app.route('/api/assistant/chat', methods=['POST'])
+@limiter.limit('120 per hour')
+def assistant_chat():
+    blocked = assistant_guard()
+    if blocked:
+        return blocked
+    try:
+        result = Assistant(db, ANTHROPIC_KEY, APP_TZ).chat((request.get_json(silent=True) or {}).get('messages'))
+    except Exception as e:
+        return assistant_failure(e)
+    return jsonify({'ok': True, **result})
+
+
+@app.route('/api/assistant/analyze', methods=['POST'])
+@limiter.limit('60 per hour')
+def assistant_analyze():
+    """Анализ ИИ по фото одного осмотра по кнопке в карточке ТС."""
+    blocked = assistant_guard()
+    if blocked:
+        return blocked
+    inspection_id = str((request.get_json(silent=True) or {}).get('inspection_id') or '').strip()
+    if not inspection_id:
+        return fail('Не указан осмотр', 400)
+    try:
+        status, report = analyze_inspection(db, ANTHROPIC_KEY, inspection_id)
+    except Exception as e:
+        return assistant_failure(e)
+    return jsonify({'ok': True, 'ai_status': status, 'ai_report': report})
 
 
 # ---------------------------------------------------------------------

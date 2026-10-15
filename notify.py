@@ -3,6 +3,7 @@ import base64
 import json
 from io import BytesIO
 
+import anthropic
 import requests
 from PIL import Image
 
@@ -95,21 +96,23 @@ class Telegram:
 
 # ---------- ИИ (Anthropic) ----------
 def _claude(api_key, model, content, max_tokens, timeout):
-    resp = requests.post(
-        'https://api.anthropic.com/v1/messages',
-        headers={'x-api-key': api_key, 'anthropic-version': '2023-06-01', 'content-type': 'application/json'},
-        json={'model': model, 'max_tokens': max_tokens, 'messages': [{'role': 'user', 'content': content}]},
-        timeout=timeout,
-    )
-    if resp.status_code == 200:
-        return resp.json()['content'][0]['text']
-    print(f'Claude API error: {resp.status_code} {resp.text}')
-    return None
+    client = anthropic.Anthropic(api_key=api_key, timeout=timeout, max_retries=1)
+    try:
+        resp = client.messages.create(model=model, max_tokens=max_tokens,
+                                      messages=[{'role': 'user', 'content': content}])
+    except anthropic.APIStatusError as e:
+        print(f'Claude API error: {e.status_code} {e.message}')
+        return None
+    except anthropic.APIConnectionError as e:
+        print(f'Claude API connection error: {e}')
+        return None
+    return next((b.text for b in resp.content if b.type == 'text'), None)
 
 
-def _image_block(fb):
-    data = base64.standard_b64encode(compress_image(fb)).decode('utf-8')
+def image_block(fb, max_dimension=1920, max_size_kb=3000):
+    data = base64.standard_b64encode(compress_image(fb, max_size_kb, max_dimension)).decode('utf-8')
     return {'type': 'image', 'source': {'type': 'base64', 'media_type': 'image/jpeg', 'data': data}}
+
 
 
 def analyze_photos_with_ai(api_key, photos):
@@ -133,7 +136,7 @@ def analyze_photos_with_ai(api_key, photos):
     content = [{'type': 'text', 'text': prompt_text}]
     for label, fb in photos:
         content.append({'type': 'text', 'text': f'Зона: {label}'})
-        content.append(_image_block(fb))
+        content.append(image_block(fb))
     try:
         return _claude(api_key, 'claude-sonnet-4-6', content, 1024, 90)
     except Exception as e:
@@ -159,9 +162,9 @@ def compare_inspections_with_ai(api_key, plate, older, newer):
             continue
         content.append({'type': 'text', 'text': f'\n--- {label} ---'})
         content.append({'type': 'text', 'text': f'Осмотр {older["date"]}'})
-        content.append(_image_block(fb_old))
+        content.append(image_block(fb_old))
         content.append({'type': 'text', 'text': f'Осмотр {newer["date"]}'})
-        content.append(_image_block(fb_new))
+        content.append(image_block(fb_new))
     try:
         return _claude(api_key, 'claude-haiku-4-5-20251001', content, 2048, 120) or 'Ошибка при обращении к ИИ.'
     except Exception as e:

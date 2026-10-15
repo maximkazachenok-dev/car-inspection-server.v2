@@ -41,6 +41,25 @@ class Supa:
         r = requests.get(f'{self.rest}/{table}', params=params, headers=self._auth(), timeout=15)
         return self._check(r).json()
 
+    def select_all(self, table, params, page=1000, max_rows=5000):
+        """Как select, но постранично: Supabase отдаёт не больше 1000 строк за запрос."""
+        rows = []
+        while len(rows) < max_rows:
+            chunk = self.select(table, {**params, 'limit': str(page), 'offset': str(len(rows))})
+            rows += chunk
+            if len(chunk) < page:
+                break
+        return rows[:max_rows]
+
+    # ---------- вход на сайт ----------
+    def auth_user(self, access_token):
+        """Пользователь сайта по токену входа или None, если токен недействителен."""
+        if not access_token:
+            return None
+        headers = {'apikey': self.key, 'Authorization': f'Bearer {access_token}'}
+        r = requests.get(f'{self.url}/auth/v1/user', headers=headers, timeout=10)
+        return r.json() if r.status_code == 200 else None
+
     def insert(self, table, rows):
         headers = {**self._auth(), 'Content-Type': 'application/json', 'Prefer': 'return=representation'}
         r = requests.post(f'{self.rest}/{table}', json=rows, headers=headers, timeout=15)
