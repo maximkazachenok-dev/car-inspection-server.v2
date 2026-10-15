@@ -19,6 +19,9 @@ const I = {
   alert: svg('<path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"/><path d="M12 9v4"/><path d="M12 17h.01"/>'),
   lock: svg('<rect width="18" height="11" x="3" y="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>'),
   logout: svg('<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" x2="9" y1="12" y2="12"/>'),
+  chat: svg('<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>'),
+  send: svg('<path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/>'),
+  spark: svg('<path d="M12 3l1.9 5.8L20 11l-6.1 2.2L12 19l-1.9-5.8L4 11l6.1-2.2z"/>'),
 };
 
 // ---------- Форматирование ----------
@@ -89,6 +92,7 @@ function layout(active, content) {
       <nav class="nav">
         <a href="#/vehicles" class="${active === 'vehicles' ? 'active' : ''}">${I.truck}Транспорт</a>
         <a href="#/drivers" class="${active === 'drivers' ? 'active' : ''}">${I.users}Водители</a>
+        <a href="#/assistant" class="${active === 'assistant' ? 'active' : ''}">${I.chat}Помощник</a>
         <a href="#/settings" class="${active === 'settings' ? 'active' : ''}">${I.gear}Настройки</a>
       </nav>
       <div class="topbar-right">
@@ -110,6 +114,7 @@ async function route() {
   if (name === 'login' || !name) { location.hash = '#/vehicles'; return; }
   if (name === 'vehicle' && id) return vehicleView(id);
   if (name === 'drivers') return driversView();
+  if (name === 'assistant') return assistantView();
   if (name === 'settings') return settingsView();
   return vehiclesView();
 }
@@ -413,6 +418,17 @@ async function toggleDetail(tr, s, vehicle, dmap, reload) {
     const lb = openModal(`<img src="${url}" alt=""><div class="lightbox-cap">${esc(btn.dataset.cap)}</div>`, { className: 'lightbox' });
     lb.el.querySelector('.lightbox').addEventListener('click', lb.close);
   }));
+  detail.querySelectorAll('[data-ai]').forEach(btn => btn.addEventListener('click', async e => {
+    e.stopPropagation();
+    btn.disabled = true;
+    btn.textContent = 'ИИ смотрит фото… до минуты';
+    const res = await guarded(() => api.analyzeInspection(btn.dataset.ai));
+    if (!res) { btn.disabled = false; btn.textContent = 'Повторить анализ'; return; }
+    toast(res.ai_status === 'done' ? 'Анализ сохранён в карточке' : 'ИИ не смог разобрать фото', res.ai_status !== 'done');
+    detail.remove();
+    tr.classList.remove('expanded');
+    toggleDetail(tr, s, vehicle, dmap, reload);
+  }));
   const closeBtn = detail.querySelector('[data-act="close"]');
   if (closeBtn) closeBtn.addEventListener('click', () => closeSessionDialog(s, vehicle, reload));
   const delBtn = detail.querySelector('[data-act="delete"]');
@@ -474,9 +490,13 @@ function renderDetail(s, vehicle, a, b, dmap, urls) {
   section('Замечания водителя');
   line('Голосом / текстом', a && a.voice_notes ? `<div class="cmt">${esc(a.voice_notes)}</div>` : '', b && b.voice_notes ? `<div class="cmt">${esc(b.voice_notes)}</div>` : '');
 
+  // Анализ «завис», если сервер перезапустился во время разбора
+  const stale = insp => Date.now() - new Date(insp.received_at || insp.inspected_at) > 10 * 60000;
+  const runBtn = (insp, label) => `<button class="btn btn-sm" data-ai="${insp.id}" style="margin-top:6px">${I.spark}${label}</button>`;
   const ai = insp => !insp ? '' : insp.ai_status === 'done' ? `<div class="ai">${esc(insp.ai_report)}</div>`
-    : insp.ai_status === 'pending' ? '<span class="muted">Анализ выполняется…</span>'
-    : insp.ai_status === 'error' ? '<span class="muted">Анализ не удался</span>' : '<span class="muted">Не подключён</span>';
+    : insp.ai_status === 'pending' ? `<span class="muted">Анализ выполняется…</span>${stale(insp) ? '<br>' + runBtn(insp, 'Запустить заново') : ''}`
+    : insp.ai_status === 'error' ? `<span class="muted">Анализ не удался</span><br>${runBtn(insp, 'Повторить анализ')}`
+    : `<span class="muted">Не выполнялся</span><br>${runBtn(insp, 'Запустить анализ ИИ')}`;
   section('Анализ ИИ');
   line('Повреждения по фото', ai(a), ai(b));
 
@@ -575,6 +595,167 @@ function driverForm(d) {
     }), f.querySelector('#df-err'));
     if (saved) { m.close(); toast('Сохранено'); driversView(); }
   });
+}
+
+// ---------- ИИ-помощник ----------
+const CHAT_KEY = 'assistant_chat_v1';
+const CHAT_EXAMPLES = [
+  'Сравни осмотры 3134КМ-2 13.10.26 и 14.10.26',
+  'Выдели авто с замечаниями',
+  'Какие ТС с критичными замечаниями?',
+  'У каких ТС заканчивается техосмотр или страховка? (где стоит «?» в проверке документов)',
+];
+
+function loadChat() {
+  try { const v = JSON.parse(localStorage.getItem(CHAT_KEY) || '[]'); return Array.isArray(v) ? v : []; } catch (e) { return []; }
+}
+function saveChat(list) {
+  try { localStorage.setItem(CHAT_KEY, JSON.stringify(list.slice(-40))); } catch (e) { /* хранилище браузера недоступно */ }
+}
+
+// Ответ ИИ в формате Markdown → безопасный HTML: текст экранируется, ссылки только на страницы сайта
+function mdInline(s) {
+  return esc(s)
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/(^|[\s(])[_*]([^_*]+)[_*](?=[\s).,!?:;]|$)/g, '$1<em>$2</em>')
+    .replace(/\[([^\]]+)\]\((#\/[A-Za-z0-9/_-]+)\)/g, '<a href="$2">$1</a>');
+}
+const LIST_RE = /^\s*([-*•]|\d+[.)])\s+/;
+function md(text) {
+  const lines = String(text || '').replace(/\r/g, '').split('\n');
+  const out = [];
+  const cells = r => r.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map(c => c.trim());
+  const isSep = r => /^[\s|:-]+$/.test(r) && r.includes('-');
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    if (!line.trim()) { i++; continue; }
+    if (/^\s*-{3,}\s*$/.test(line)) { out.push('<hr>'); i++; continue; }
+    const h = line.match(/^#{1,6}\s+(.*)/);
+    if (h) { out.push(`<div class="md-h">${mdInline(h[1])}</div>`); i++; continue; }
+    if (/^\s*\|/.test(line)) {
+      const rows = [];
+      while (i < lines.length && /^\s*\|/.test(lines[i])) rows.push(lines[i++]);
+      const head = rows.length > 1 && isSep(rows[1]) ? cells(rows[0]) : null;
+      const body = rows.slice(head ? 2 : 0).filter(r => !isSep(r)).map(cells);
+      out.push(`<div class="table-wrap"><table class="tbl md-tbl">${head ? `<thead><tr>${head.map(c => `<th>${mdInline(c)}</th>`).join('')}</tr></thead>` : ''}<tbody>${
+        body.map(r => `<tr>${r.map(c => `<td>${mdInline(c)}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`);
+      continue;
+    }
+    if (LIST_RE.test(line)) {
+      const ordered = /^\s*\d/.test(line);
+      const items = [];
+      while (i < lines.length && LIST_RE.test(lines[i])) items.push(lines[i++].replace(LIST_RE, ''));
+      const tag = ordered ? 'ol' : 'ul';
+      out.push(`<${tag}>${items.map(t => `<li>${mdInline(t)}</li>`).join('')}</${tag}>`);
+      continue;
+    }
+    const para = [];
+    while (i < lines.length && lines[i].trim() && !/^\s*\||^#{1,6}\s|^\s*-{3,}\s*$/.test(lines[i]) && !LIST_RE.test(lines[i])) para.push(lines[i++]);
+    out.push(`<p>${para.map(mdInline).join('<br>')}</p>`);
+  }
+  return out.join('');
+}
+
+let chatBusy = false;
+
+function assistantView() {
+  const page = layout('assistant', `
+    <div class="page-head">
+      <div><div class="page-title">Помощник</div><div class="page-sub">Вопросы по осмотрам обычным языком. Ответы готовит ИИ по данным сайта</div></div>
+      <div class="actions"><button class="btn" id="chat-new">${I.plus}Новый разговор</button></div>
+    </div>
+    <div class="card chat">
+      <div class="chat-log" id="chat-log"></div>
+      <form class="chat-form" id="chat-form">
+        <textarea id="chat-input" rows="2" placeholder="Например: сравни осмотры 3134КМ-2 13.10.26 и 14.10.26"></textarea>
+        <button class="btn btn-primary" type="submit" id="chat-send">${I.send}<span>Отправить</span></button>
+      </form>
+      <div class="chat-hint">Enter — отправить, Shift+Enter — новая строка. ИИ может ошибаться: проверяйте важное в карточке ТС.</div>
+    </div>`);
+  const log = page.querySelector('#chat-log');
+  const input = page.querySelector('#chat-input');
+  const form = page.querySelector('#chat-form');
+  let messages = loadChat();
+
+  const render = () => {
+    if (!api.assistantConfigured) {
+      log.innerHTML = `<div class="empty"><strong>Помощник не подключён</strong>Добавьте адрес сервера SERVER_URL в файл portal/config.js.</div>`;
+      return;
+    }
+    if (!messages.length && !chatBusy) {
+      log.innerHTML = `<div class="chat-intro">
+        <div class="chat-intro-icon">${I.spark}</div>
+        <div class="cell-main">Спросите о машинах, осмотрах и замечаниях</div>
+        <div class="cell-sub">Помощник ищет данные по всем ТС, сравнивает осмотры и рассматривает фото.</div>
+        <div class="chips">${CHAT_EXAMPLES.map(t => `<button class="chip" type="button" data-q="${esc(t)}">${esc(t)}</button>`).join('')}</div>
+      </div>`;
+      log.querySelectorAll('[data-q]').forEach(b => b.addEventListener('click', () => send(b.dataset.q)));
+      return;
+    }
+    log.innerHTML = messages.map((m, k) => m.role === 'user'
+      ? `<div class="msg user"><div class="bubble">${esc(m.content).replace(/\n/g, '<br>')}</div></div>`
+      : m.error
+        ? `<div class="msg bot"><div class="bubble error">${I.alert}<div>${esc(m.content)}<div><button class="btn btn-sm" data-retry="${k}" type="button" style="margin-top:8px">Повторить</button></div></div></div></div>`
+        : `<div class="msg bot"><div class="bubble md">${md(m.content)}${m.steps && m.steps.length
+            ? `<div class="steps">Проверено: ${m.steps.map(esc).join(' · ')}</div>` : ''}</div></div>`).join('')
+      + (chatBusy ? `<div class="msg bot"><div class="bubble thinking"><span class="dots"><i></i><i></i><i></i></span>Ищу данные и готовлю ответ. Сравнение фото занимает до двух минут</div></div>` : '');
+    log.querySelectorAll('[data-retry]').forEach(b => b.addEventListener('click', () => {
+      messages = messages.slice(0, Number(b.dataset.retry));
+      saveChat(messages);
+      ask();
+    }));
+    log.scrollTop = log.scrollHeight;
+  };
+
+  const ask = async () => {
+    chatBusy = true;
+    page.querySelector('#chat-send').disabled = true;
+    render();
+    const history = messages.filter(m => !m.error).map(m => ({ role: m.role, content: m.content }));
+    try {
+      const res = await api.askAssistant(history);
+      messages.push({ role: 'assistant', content: res.answer, steps: res.steps || [] });
+    } catch (e) {
+      messages.push({ role: 'assistant', content: e.message, error: true });
+    }
+    chatBusy = false;
+    saveChat(messages);
+    // Пользователь мог уйти на другую страницу, пока ждал ответ, и вернуться в новый экран чата
+    if (!document.body.contains(log)) {
+      if (location.hash.startsWith('#/assistant')) assistantView();
+      return;
+    }
+    page.querySelector('#chat-send').disabled = false;
+    render();
+    input.focus();
+  };
+
+  const send = text => {
+    text = String(text || '').trim();
+    if (!text || chatBusy || !api.assistantConfigured) return;
+    messages = messages.filter(m => !m.error);
+    messages.push({ role: 'user', content: text });
+    saveChat(messages);
+    input.value = '';
+    ask();
+  };
+
+  form.addEventListener('submit', e => { e.preventDefault(); send(input.value); });
+  input.addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(input.value); }
+  });
+  page.querySelector('#chat-new').addEventListener('click', () => {
+    if (chatBusy) return;
+    messages = [];
+    saveChat(messages);
+    render();
+    input.focus();
+  });
+  page.querySelector('#chat-send').disabled = chatBusy;
+  render();
+  input.focus();
 }
 
 // ---------- Настройки ----------

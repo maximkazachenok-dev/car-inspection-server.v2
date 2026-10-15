@@ -146,6 +146,35 @@ export async function deleteAcceptance(sessionId) {
   return true;
 }
 
+// ---------- ИИ-помощник (через сервер на Railway: ключ ИИ хранится только там) ----------
+const SERVER_URL = String(cfg.SERVER_URL || '').trim().replace(/\/+$/, '').replace(/\/submit$/, '');
+export const assistantConfigured = Boolean(SERVER_URL && !SERVER_URL.includes('ВАШ'));
+
+async function serverPost(path, body) {
+  if (!assistantConfigured) throw new Error('Не указан адрес сервера: добавьте SERVER_URL в файл portal/config.js');
+  const session = await getSession();
+  if (!session) throw new Error('Сеанс входа истёк. Войдите заново.');
+  let resp;
+  try {
+    resp = await fetch(SERVER_URL + path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + session.access_token },
+      body: JSON.stringify(body),
+    });
+  } catch (e) {
+    throw new Error('Нет связи с сервером. Проверьте интернет и повторите.');
+  }
+  let data = null;
+  try { data = await resp.json(); } catch (e) { /* ответ не JSON */ }
+  if (resp.ok && data && data.ok) return data;
+  if (data && data.error) throw new Error(data.error);
+  if (resp.status === 429) throw new Error('Слишком много запросов подряд. Подождите несколько минут.');
+  if (resp.status === 502 || resp.status === 504) throw new Error('Сервер не успел ответить. Повторите или упростите вопрос.');
+  throw new Error(`Сервер ответил с ошибкой ${resp.status}`);
+}
+export function askAssistant(messages) { return serverPost('/api/assistant/chat', { messages }); }
+export function analyzeInspection(inspectionId) { return serverPost('/api/assistant/analyze', { inspection_id: inspectionId }); }
+
 // ---------- Настройки ----------
 export async function getSetting(key, fallback) {
   const rows = check(await sb.from('settings').select('*').eq('key', key));
