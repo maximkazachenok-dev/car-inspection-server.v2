@@ -286,3 +286,34 @@ def test_chat_endpoint_bad_request(client, monkeypatch):
     monkeypatch.setattr(server, 'ANTHROPIC_KEY', 'key')
     r = client.post('/api/assistant/chat', json={'messages': []}, headers={'Authorization': 'Bearer good'})
     assert r.status_code == 400 and r.get_json()['error'] == 'Напишите вопрос'
+
+
+# ---------- выбор модели (ASSISTANT_MODEL) ----------
+def test_pick_model():
+    assert assistant.pick_model('') == ('claude-opus-5-5', None)
+    assert assistant.pick_model(' claude-sonnet-5-5 ') == ('claude-sonnet-5-5', None)
+    model, warning = assistant.pick_model('claude-sonet-5-5')       # опечатка не ломает чат
+    assert model == 'claude-opus-5-5' and 'не поддерживается' in warning
+
+
+@pytest.mark.parametrize('model, with_fallback', [('claude-sonnet-5-5', True), ('claude-haiku-5-5', False)])
+def test_chat_uses_selected_model(db, monkeypatch, model, with_fallback):
+    fake = FakeClient([reply([block(type='text', text='ok')])])
+    monkeypatch.setattr(assistant.anthropic, 'Anthropic', lambda **kw: fake)
+    out = Assistant(db, 'key', TZ, model).chat([{'role': 'user', 'content': 'q'}])
+    call = fake.calls[0]
+    assert call['model'] == model and out['model'] == model
+    assert ('fallbacks' in call) is with_fallback          # у Haiku 5.5 запасной модели нет
+
+
+def test_server_passes_model_and_health_shows_it(client, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(server, 'ANTHROPIC_KEY', 'key')
+    monkeypatch.setattr(server, 'ASSISTANT_MODEL', 'claude-sonnet-5-5')
+    monkeypatch.setattr(Assistant, 'chat', lambda self, history: seen.setdefault('model', self.model) and {
+        'answer': 'ok', 'steps': [], 'usage': {}, 'model': self.model})
+    r = client.post('/api/assistant/chat', json={'messages': [{'role': 'user', 'content': 'q'}]},
+                    headers={'Authorization': 'Bearer good'})
+    assert r.get_json()['model'] == 'claude-sonnet-5-5' and seen['model'] == 'claude-sonnet-5-5'
+    monkeypatch.setattr(server, 'SUPABASE_URL', '')
+    assert client.get('/api/health').get_json()['модель помощника'] == 'claude-sonnet-5-5'

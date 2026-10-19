@@ -698,8 +698,9 @@ function assistantView() {
       ? `<div class="msg user"><div class="bubble">${esc(m.content).replace(/\n/g, '<br>')}</div></div>`
       : m.error
         ? `<div class="msg bot"><div class="bubble error">${I.alert}<div>${esc(m.content)}<div><button class="btn btn-sm" data-retry="${k}" type="button" style="margin-top:8px">Повторить</button></div></div></div></div>`
-        : `<div class="msg bot"><div class="bubble md">${md(m.content)}${m.steps && m.steps.length
-            ? `<div class="steps">Проверено: ${m.steps.map(esc).join(' · ')}</div>` : ''}</div></div>`).join('')
+        : `<div class="msg bot"><div class="bubble md">${md(m.content)}${(m.steps && m.steps.length) || m.model
+            ? `<div class="steps">${m.steps && m.steps.length ? 'Проверено: ' + m.steps.map(esc).join(' · ') : ''}${
+                m.model ? `<div>Модель: ${esc(m.model)}</div>` : ''}</div>` : ''}</div></div>`).join('')
       + (chatBusy ? `<div class="msg bot"><div class="bubble thinking"><span class="dots"><i></i><i></i><i></i></span>Ищу данные и готовлю ответ. Сравнение фото занимает до двух минут</div></div>` : '');
     log.querySelectorAll('[data-retry]').forEach(b => b.addEventListener('click', () => {
       messages = messages.slice(0, Number(b.dataset.retry));
@@ -716,7 +717,7 @@ function assistantView() {
     const history = messages.filter(m => !m.error).map(m => ({ role: m.role, content: m.content }));
     try {
       const res = await api.askAssistant(history);
-      messages.push({ role: 'assistant', content: res.answer, steps: res.steps || [] });
+      messages.push({ role: 'assistant', content: res.answer, steps: res.steps || [], model: res.model || '' });
     } catch (e) {
       messages.push({ role: 'assistant', content: e.message, error: true });
     }

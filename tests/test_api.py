@@ -21,7 +21,7 @@ class FakeSupa:
 
     def __init__(self):
         self.t = {k: [] for k in ['vehicles', 'drivers', 'inspections', 'inspection_photos',
-                                  'inspection_checks', 'usage_sessions']}
+                                  'inspection_checks', 'usage_sessions', 'settings']}
         self.files = {}
         self.fail_session_insert = False
 
@@ -214,3 +214,17 @@ def test_caption_contains_card_link_and_distance(env):
     cap = server.build_caption(env['truck'], env['ivanov'], 'return', datetime.fromisoformat('2026-10-08T09:30:00+03:00'),
                                215990, None, Decision('close', distance=1590), [], {}, None, {})
     assert 'Пройдено: 1 590 км' in cap and '#/vehicle/' + env['truck']['id'] in cap and 'СДАЧА' in cap
+
+
+def test_env_strips_spaces_quotes_and_newlines(monkeypatch):
+    for raw in ['  abc  ', '"abc"', "'abc'\n", 'abc\r\n']:
+        monkeypatch.setenv('X_TEST_VAR', raw)
+        assert server.env('X_TEST_VAR') == 'abc'
+
+
+def test_health_details_reports_settings_without_secrets(env):
+    body = env['client'].get('/api/health').get_json()
+    assert body['API_TOKEN'] == {'задан': True, 'длина': len('test-token'),
+                                 'отпечаток': server.fingerprint('test-token')}
+    assert body['SUPABASE_KEY'] == 'secret (верно)' and body['supabase'] == 'подключено'
+    assert 'test-token' not in str(body) and 'sb_secret_x' not in str(body)
