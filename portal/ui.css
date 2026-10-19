@@ -235,6 +235,7 @@ tr.detail > td { padding: 0 !important; background: #fbfcfe; }
 .md p:last-child, .md ul:last-child, .md ol:last-child { margin-bottom: 0; }
 .md ul, .md ol { margin: 0 0 var(--s2) var(--s5); }
 .md li { margin: 2px 0; }
+.md li.li-bad { color: var(--danger); font-weight: 700; }
 .md a { font-weight: 700; }
 .md code { padding: 1px 5px; border-radius: 5px; background: var(--surface-3); font-size: 13px; }
 .md hr { border: none; border-top: 1px solid var(--border); margin: var(--s3) 0; }

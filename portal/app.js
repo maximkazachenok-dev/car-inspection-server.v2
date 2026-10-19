@@ -648,7 +648,8 @@ function md(text) {
       const items = [];
       while (i < lines.length && LIST_RE.test(lines[i])) items.push(lines[i++].replace(LIST_RE, ''));
       const tag = ordered ? 'ol' : 'ul';
-      out.push(`<${tag}>${items.map(t => `<li>${mdInline(t)}</li>`).join('')}</${tag}>`);
+      // Пункты о безопасности движения (🔴) выделяются красным
+      out.push(`<${tag}>${items.map(t => `<li${/^\s*🔴/u.test(t) ? ' class="li-bad"' : ''}>${mdInline(t)}</li>`).join('')}</${tag}>`);
       continue;
     }
     const para = [];
