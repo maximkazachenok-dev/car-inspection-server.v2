@@ -262,3 +262,11 @@ tr.detail > td { padding: 0 !important; background: #fbfcfe; }
   .cmp { grid-template-columns: 110px 1fr 1fr; font-size: 13px; }
   .detail-body { padding: var(--s3); }
 }
+
+/* ===== Отметка «Замечания устранены» ===== */
+.resolve { display: flex; align-items: center; gap: var(--s3); flex-wrap: wrap; margin-right: auto; padding: 8px var(--s3); border-radius: var(--r-sm); }
+.resolve.bad { background: var(--danger-soft); }
+.resolve.ok { background: var(--success-soft); }
+.resolve .check { font-size: 14px; color: var(--text); }
+.resolve input { width: 18px; height: 18px; accent-color: var(--success); }
+.resolve .cell-sub { margin-top: 0; }

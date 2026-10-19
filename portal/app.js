@@ -36,6 +36,13 @@ function daysBetween(a, b) {
   return Math.max(1, Math.ceil(ms / 86400000));
 }
 const KIND = { truck: 'Автомобиль', trailer: 'Прицеп' };
+// Маркер «Замечания»: красный — есть неустранённые, зелёный — замечаний нет или они устранены.
+// unresolved == null — в базе ещё не выполнен скрипт 003_remarks.sql.
+function remarkMark(unresolved, total = 0) {
+  if (unresolved == null) return '<span class="muted">—</span>';
+  if (unresolved > 0) return '<span class="st bad"><span class="dot"></span>Есть</span>';
+  return `<span class="st ok"><span class="dot"></span>${total > 0 ? 'Устранены' : 'Нет'}</span>`;
+}
 const STATUS_LABEL = { ok: 'Всё хорошо', warn: 'Замечание', bad: 'Критично' };
 
 // ---------- Уведомления и модальные окна ----------
@@ -193,7 +200,7 @@ async function vehiclesView() {
     }
     if (!rows.length) { list.innerHTML = '<div class="empty">Ничего не найдено</div>'; return; }
     list.innerHTML = `<div class="table-wrap"><table class="tbl">
-      <thead><tr><th>Номер</th><th>Тип</th><th>Статус</th><th class="r">Последний пробег</th><th>Последний осмотр</th></tr></thead>
+      <thead><tr><th>Номер</th><th>Тип</th><th>Статус</th><th>Замечания</th><th class="r">Последний пробег</th><th>Последний осмотр</th></tr></thead>
       <tbody>${rows.map(v => `
         <tr class="clickable ${v.is_active ? '' : 'inactive'}" data-id="${v.id}">
           <td><div class="cell-main">${esc(v.plate)}</div>${v.model ? `<div class="cell-sub">${esc(v.model)}</div>` : ''}</td>
@@ -201,6 +208,7 @@ async function vehiclesView() {
           <td>${!v.is_active ? '<span class="badge b-grey">Неактивно</span>' : v.open_session_id
               ? `<span class="badge b-line">На линии</span><div class="cell-sub">${esc(v.open_driver_name || '')}${v.open_since ? ' с ' + fmtDay(v.open_since) : ''}</div>`
               : '<span class="badge b-free">Свободно</span>'}</td>
+          <td>${remarkMark(v.unresolved_remarks)}</td>
           <td class="r num">${v.kind === 'truck' ? (v.last_mileage != null ? num(v.last_mileage) + ' км' : '—') : '—'}</td>
           <td>${v.last_inspection_at ? fmtDate(v.last_inspection_at) : '<span class="muted">—</span>'}</td>
         </tr>`).join('')}</tbody></table></div>`;
@@ -297,11 +305,12 @@ function importDialog(kind, after) {
 }
 
 // ---------- Карточка ТС ----------
-async function vehicleView(id) {
+async function vehicleView(id, expandSid) {
   const page = layout('vehicles', loadingHtml());
-  const [vehicle, sessions, dmap, threshold] = await Promise.all([
+  const [vehicle, sessions, dmap, threshold, remarks] = await Promise.all([
     guarded(() => api.getVehicle(id)), guarded(() => api.listSessions(id)),
     guarded(() => driversMap(true)), guarded(() => api.getSetting('unaccounted_threshold_km', 0)),
+    api.listSessionRemarks(id).catch(() => null),
   ]);
   if (!vehicle) { page.innerHTML = `<div class="empty"><strong>ТС не найдено</strong><a href="#/vehicles">Вернуться к списку</a></div>`; return; }
   state.threshold = Number(threshold) || 0;
@@ -339,8 +348,8 @@ async function vehicleView(id) {
     if (!g) return '';
     const period = `${g.from ? 'сдача ' + fmtDay(g.from) : ''}${g.to ? ' → приёмка ' + fmtDay(g.to) : ''}`;
     return g.diff > 0
-      ? `<tr class="gap"><td colspan="7"><div class="gap-note warn">${I.alert}Неучтённый ${isTruck ? 'пробег' : 'наработка'}: ${num(g.diff)} ${unit} <span style="font-weight:500">(${period})</span></div></td></tr>`
-      : `<tr class="gap"><td colspan="7"><div class="gap-note bad">${I.alert}При приёмке на ${num(-g.diff)} ${unit} меньше, чем при предыдущей сдаче — проверьте показания <span style="font-weight:500">(${period})</span></div></td></tr>`;
+      ? `<tr class="gap"><td colspan="8"><div class="gap-note warn">${I.alert}Неучтённый ${isTruck ? 'пробег' : 'наработка'}: ${num(g.diff)} ${unit} <span style="font-weight:500">(${period})</span></div></td></tr>`
+      : `<tr class="gap"><td colspan="8"><div class="gap-note bad">${I.alert}При приёмке на ${num(-g.diff)} ${unit} меньше, чем при предыдущей сдаче — проверьте показания <span style="font-weight:500">(${period})</span></div></td></tr>`;
   };
   const row = s => {
     const start = startVal(s), end = endVal(s);
@@ -359,6 +368,7 @@ async function vehicleView(id) {
             : '<span class="muted">—</span>'}</td>
         <td class="r num">${dist != null ? `<span class="dist">${num(dist)}</span> ${unit}` : '<span class="muted">—</span>'}</td>
         <td class="r num">${s.started_at ? daysBetween(s.started_at, s.ended_at) : '<span class="muted">—</span>'}</td>
+        <td>${remarks ? remarkMark(remarks[s.id] ? remarks[s.id].unresolved : 0, remarks[s.id] ? remarks[s.id].remark_inspections : 0) : remarkMark(null)}</td>
         <td>${statusBadges(s)}</td>
       </tr>${gapRow(s)}`;
   };
@@ -385,32 +395,44 @@ async function vehicleView(id) {
     </div>
     <div class="card">
       ${list.length ? `<div class="table-wrap"><table class="tbl sessions">
-        <thead><tr><th></th><th>Водитель</th><th>Приёмка</th><th>Сдача</th><th class="r">${isTruck ? 'Пройдено' : 'Наработка'}</th><th class="r">Дней</th><th>Статус</th></tr></thead>
+        <thead><tr><th></th><th>Водитель</th><th>Приёмка</th><th>Сдача</th><th class="r">${isTruck ? 'Пройдено' : 'Наработка'}</th><th class="r">Дней</th><th>Замечания</th><th>Статус</th></tr></thead>
         <tbody>${list.map(row).join('')}</tbody></table></div>`
         : `<div class="empty"><strong>Осмотров пока нет</strong>Строка появится, когда водитель оформит приёмку или сдачу в приложении.</div>`}
     </div>`;
 
   page.querySelector('#edit-veh').addEventListener('click', () => vehicleForm(vehicle, () => vehicleView(id)));
-  page.querySelectorAll('tr.srow').forEach(tr => tr.addEventListener('click', () => {
+  const open = tr => {
     const s = list.find(x => x.id === tr.dataset.sid);
-    toggleDetail(tr, s, vehicle, dmap, () => vehicleView(id));
-  }));
+    toggleDetail(tr, s, vehicle, dmap, sid => vehicleView(id, sid), remarks && remarks[s.id]);
+  };
+  page.querySelectorAll('tr.srow').forEach(tr => tr.addEventListener('click', () => open(tr)));
+  // После отметки «Замечания устранены» страница перерисовывается — та же строка остаётся раскрытой
+  const again = expandSid && page.querySelector(`tr.srow[data-sid="${expandSid}"]`);
+  if (again) open(again);
 }
 
-async function toggleDetail(tr, s, vehicle, dmap, reload) {
+async function toggleDetail(tr, s, vehicle, dmap, reload, rem) {
   const next = tr.nextElementSibling;
   if (next && next.classList.contains('detail')) { next.remove(); tr.classList.remove('expanded'); return; }
   tr.classList.add('expanded');
   const detail = document.createElement('tr');
   detail.className = 'detail';
-  detail.innerHTML = `<td colspan="7">${loadingHtml('Загружаем осмотры…')}</td>`;
+  detail.innerHTML = `<td colspan="8">${loadingHtml('Загружаем осмотры…')}</td>`;
   tr.after(detail);
   const details = await guarded(() => api.getInspectionDetails([s.start_inspection_id, s.end_inspection_id]));
   if (!details) { detail.firstElementChild.innerHTML = '<div class="empty">Не удалось загрузить</div>'; return; }
   const a = details[s.start_inspection_id] || null, b = details[s.end_inspection_id] || null;
   const paths = [a, b].filter(Boolean).flatMap(x => x.photos.flatMap(p => [p.thumb_path, p.path]));
   const urls = (await guarded(() => api.signedUrls(paths))) || {};
-  detail.firstElementChild.innerHTML = renderDetail(s, vehicle, a, b, dmap, urls);
+  detail.firstElementChild.innerHTML = renderDetail(s, vehicle, a, b, dmap, urls, rem);
+  const resolve = detail.querySelector('[data-resolve]');
+  if (resolve) resolve.addEventListener('change', async () => {
+    resolve.disabled = true;
+    const ok = await guarded(() => api.setRemarksResolved(s.id, resolve.checked).then(() => true));
+    if (!ok) { resolve.checked = !resolve.checked; resolve.disabled = false; return; }
+    toast(resolve.checked ? 'Замечания отмечены как устранённые' : 'Отметка снята');
+    reload(s.id);
+  });
   detail.querySelectorAll('[data-full]').forEach(btn => btn.addEventListener('click', e => {
     e.stopPropagation();
     const url = urls[btn.dataset.full];
@@ -440,7 +462,7 @@ async function toggleDetail(tr, s, vehicle, dmap, reload) {
   });
 }
 
-function renderDetail(s, vehicle, a, b, dmap, urls) {
+function renderDetail(s, vehicle, a, b, dmap, urls, rem) {
   const isTruck = vehicle.kind === 'truck';
   const who = insp => (insp && dmap[insp.driver_id] ? dmap[insp.driver_id].full_name : '');
   const head = (title, insp) => `<div class="h">${title}<strong>${insp ? `${fmtDate(insp.inspected_at)} ${fmtTime(insp.inspected_at)} · ${esc(who(insp))}` : '—'}</strong></div>`;
@@ -508,7 +530,20 @@ function renderDetail(s, vehicle, a, b, dmap, urls) {
   const actions = [];
   if (s.status === 'open') actions.push(`<button class="btn" data-act="close">Закрыть вручную</button>`);
   if (s.status === 'open' && !s.end_inspection_id && s.start_inspection_id) actions.push(`<button class="btn btn-danger" data-act="delete">Удалить приёмку</button>`);
-  return `<div class="detail-body">${actions.length ? `<div class="detail-actions">${actions.join('')}</div>` : ''}<div class="cmp">${out.join('')}</div></div>`;
+  // Отметка «Замечания устранены» — только у строки, где водитель указал замечания
+  let resolveBox = '';
+  if (rem && rem.remark_inspections > 0) {
+    const done = rem.unresolved === 0;
+    const note = done
+      ? `Отметил ${esc(rem.remarks_resolved_by || '')} ${fmtDate(rem.remarks_resolved_at)} ${fmtTime(rem.remarks_resolved_at)}`
+      : rem.remarks_resolved_at
+        ? `После отметки ${fmtDate(rem.remarks_resolved_at)} ${fmtTime(rem.remarks_resolved_at)} пришли новые замечания`
+        : 'Поставьте отметку, когда замечания по этой строке устранены';
+    resolveBox = `<div class="resolve ${done ? 'ok' : 'bad'}">
+      <label class="check"><input type="checkbox" data-resolve ${done ? 'checked' : ''}><b>Замечания устранены</b></label>
+      <span class="cell-sub">${note}</span></div>`;
+  }
+  return `<div class="detail-body">${resolveBox || actions.length ? `<div class="detail-actions">${resolveBox}${actions.join('')}</div>` : ''}<div class="cmp">${out.join('')}</div></div>`;
 }
 
 function closeSessionDialog(s, vehicle, reload) {

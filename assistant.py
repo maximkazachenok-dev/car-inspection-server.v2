@@ -5,6 +5,7 @@
 кроме сохранения анализа ИИ по фото в осмотр.
 """
 import json
+import re
 import time
 from datetime import date, datetime, timedelta, timezone
 
@@ -12,6 +13,7 @@ import anthropic
 
 from notify import analyze_photos_with_ai, image_block
 from sessions import normalize_plate
+from supa import SupaError
 
 DEFAULT_MODEL = 'claude-opus-5-5'
 # Модели, с которыми помощник работает: они понимают все части запроса (инструменты, effort,
@@ -29,6 +31,21 @@ KIND_RU = {'acceptance': 'приёмка', 'return': 'сдача'}
 VEHICLE_KIND_RU = {'truck': 'автомобиль', 'trailer': 'прицеп'}
 STATUS_RU = {'ok': 'всё хорошо', 'warn': 'некритичное замечание (?)', 'bad': 'критичное замечание (!)'}
 WEEKDAYS = ['понедельник', 'вторник', 'среда', 'четверг', 'пятница', 'суббота', 'воскресенье']
+
+
+# Текст водителя, который не считается замечанием. Тот же список — в supabase/003_remarks.sql (is_driver_remark).
+NO_REMARK_PHRASES = {
+    '', 'все хорошо', 'все в порядке', 'все нормально', 'все норм', 'все ок', 'все ok', 'все исправно',
+    'хорошо', 'нормально', 'норм', 'ок', 'ok', 'нет', 'нету', 'в порядке', 'исправно',
+    'замечаний нет', 'нет замечаний', 'без замечаний', 'претензий нет', 'нет претензий'}
+
+
+def is_driver_remark(text):
+    """«Не работает домкрат» — замечание, «Всё хорошо!» — нет."""
+    if not text:
+        return False
+    norm = re.sub(r'[^0-9a-zа-я]+', ' ', str(text).lower().replace('ё', 'е')).strip()
+    return norm not in NO_REMARK_PHRASES
 
 
 class AssistantError(Exception):
@@ -77,7 +94,9 @@ SYSTEM_PROMPT = """Ты — ИИ-помощник администратора �
 с подписью: спереди, сзади, левый бок (сторона водителя), правый бок, салон, внутри прицепа; (3) если номер виден \
 и не совпадает — это другая машина. Повреждения сравнивай только по парам, где оба фото годные. Отличай \
 повреждения от бликов, грязи, снега и другого ракурса; если не уверен — так и напиши.
-- Списки ТС с замечаниями — find_remarks. Для вопросов о текущем положении бери scope=current.
+- Списки ТС с замечаниями — find_remarks. Для вопросов о текущем положении бери scope=current. Замечания, \
+отмеченные на сайте галочкой «Замечания устранены», find_remarks по умолчанию не возвращает (их число — \
+в resolved_hidden). Если спрашивают об устранённых или обо всей истории, передай include_resolved=true.
 - Если ТС не найдено, предложи похожие номера из ответа инструмента.
 - run_damage_analysis вызывай, только когда пользователь просит запустить или сохранить анализ ИИ по фото: \
 результат записывается в карточку ТС.
@@ -157,6 +176,9 @@ TOOLS = [
                 'severity': {'type': 'string', 'enum': ['any', 'critical'],
                              'description': 'any — некритичные и критичные, critical — только критичные'},
                 'area': {'type': 'string', 'enum': ['all', 'documents', 'tmc', 'driver_notes']},
+                'include_resolved': {'type': 'boolean',
+                                     'description': 'Показать и замечания, отмеченные на сайте как устранённые '
+                                                    '(по умолчанию — нет)'},
             },
             'required': ['scope'],
             'additionalProperties': False,
@@ -361,7 +383,23 @@ class Assistant:
                 'count': len(result), 'inspections': result,
                 'note': None if result else 'За указанный период осмотров нет'}
 
-    def tool_find_remarks(self, scope='current', date_from=None, date_to=None, severity='any', area='all'):
+    def resolved_sessions(self, session_ids):
+        """{строка: когда отмечено «Замечания устранены»}. Пусто, если скрипт 003_remarks.sql не выполнен."""
+        ids = sorted({x for x in session_ids if x})
+        out = {}
+        try:
+            for i in range(0, len(ids), 100):
+                for r in self.db.select('usage_sessions', {'id': f'in.({",".join(ids[i:i + 100])})',
+                                                           'select': 'id,remarks_resolved_at'}):
+                    if r.get('remarks_resolved_at'):
+                        out[r['id']] = r['remarks_resolved_at']
+        except SupaError as e:
+            print(f'Remarks resolution unavailable: {e}')
+            return {}
+        return out
+
+    def tool_find_remarks(self, scope='current', date_from=None, date_to=None, severity='any', area='all',
+                          include_resolved=False):
         statuses = ['bad'] if severity == 'critical' else ['warn', 'bad']
         if scope == 'period':
             period = self.day_bounds(date_from, date_to)
@@ -371,16 +409,25 @@ class Assistant:
         else:
             insps = self.db.select_all('v_last_inspections', {'order': 'inspected_at.desc'})
         checks = self.checks_for([i['id'] for i in insps], statuses) if area in ('all', 'tmc') and insps else {}
+        resolved = self.resolved_sessions(i.get('session_id') for i in insps)
 
-        by_vehicle = {}
+        by_vehicle, hidden = {}, 0
         for i in insps:
             docs = area in ('all', 'documents') and i.get('doc_status') in statuses
             tmc = checks.get(i['id'], []) if area in ('all', 'tmc') else []
-            notes = area in ('all', 'driver_notes') and severity == 'any' and bool(i.get('voice_notes'))
+            notes = area in ('all', 'driver_notes') and severity == 'any' and is_driver_remark(i.get('voice_notes'))
             if not (docs or tmc or notes):
+                continue
+            # Отметка «Замечания устранены» действует на замечания, пришедшие до неё
+            done_at = resolved.get(i.get('session_id'))
+            is_done = bool(done_at) and self.local(i.get('received_at') or i['inspected_at']) <= self.local(done_at)
+            if is_done and not include_resolved:
+                hidden += 1
                 continue
             d = {'inspection_id': i['id'], 'date': self.fmt_dt(i['inspected_at']),
                  'kind': KIND_RU.get(i['kind']), 'driver': self.drivers().get(i.get('driver_id'))}
+            if is_done:
+                d['resolved'] = f'устранены (отметка {self.fmt_dt(done_at)})'
             if docs:
                 d['documents'] = {'status': STATUS_RU[i['doc_status']], 'comment': i.get('doc_comment')}
             if tmc:
@@ -397,7 +444,8 @@ class Assistant:
                              'inactive': not v.get('is_active', True) or None, 'inspections': items})
         vehicles.sort(key=lambda x: x['plate'] or '')
         return {'scope': 'последний осмотр каждого ТС' if scope != 'period' else 'осмотры за период',
-                'inspections_checked': len(insps), 'vehicles_with_remarks': len(vehicles), 'vehicles': vehicles}
+                'inspections_checked': len(insps), 'vehicles_with_remarks': len(vehicles),
+                'resolved_hidden': hidden, 'vehicles': vehicles}
 
     def tool_view_photos(self, inspection_ids, labels=None):
         ids = [str(x) for x in inspection_ids][:4]

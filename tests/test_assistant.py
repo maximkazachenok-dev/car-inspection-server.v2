@@ -30,7 +30,8 @@ class FakeRest:
     """Имитация PostgREST с операторами eq, in, gte, lt, order, limit, offset."""
 
     def __init__(self):
-        self.t = {k: [] for k in ['vehicles', 'drivers', 'inspections', 'inspection_photos', 'inspection_checks']}
+        self.t = {k: [] for k in ['vehicles', 'drivers', 'inspections', 'inspection_photos', 'inspection_checks',
+                                  'usage_sessions']}
         self.updates = []
 
     @staticmethod
@@ -317,3 +318,52 @@ def test_server_passes_model_and_health_shows_it(client, monkeypatch):
     assert r.get_json()['model'] == 'claude-sonnet-5-5' and seen['model'] == 'claude-sonnet-5-5'
     monkeypatch.setattr(server, 'SUPABASE_URL', '')
     assert client.get('/api/health').get_json()['модель помощника'] == 'claude-sonnet-5-5'
+
+
+
+# ---------- замечания: «Всё хорошо» и отметка «Замечания устранены» ----------
+def test_driver_remark_phrases():
+    assert not assistant.is_driver_remark('Всё хорошо!')
+    assert not assistant.is_driver_remark('  замечаний нет. ')
+    assert not assistant.is_driver_remark(None)
+    assert assistant.is_driver_remark('Не работает домкрат')
+
+
+def test_phrase_list_same_in_sql():
+    import re as _re
+    sql = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            'supabase', '003_remarks.sql'), encoding='utf-8').read()
+    block = sql[sql.index('not in ('):sql.index('false)')]
+    assert set(_re.findall(r"'([^']*)'", block)) == assistant.NO_REMARK_PHRASES
+
+
+def test_all_good_note_is_not_a_remark(helper, db):
+    db.t['inspections'][2]['voice_notes'] = 'Всё хорошо'          # у v2 остаётся только огнетушитель
+    v2 = [v for v in helper.tool_find_remarks(scope='current')['vehicles'] if v['plate'] == 'АХ5463-5'][0]
+    assert 'driver_notes' not in v2['inspections'][0] and v2['inspections'][0]['tmc']
+
+
+def test_resolved_remarks_hidden_until_new_ones(helper, db):
+    db.t['inspections'][1].update(session_id='s1', received_at='2026-10-13T21:31:00Z')
+    db.t['usage_sessions'] = [{'id': 's1', 'remarks_resolved_at': '2026-10-14T08:00:00Z'}]
+    r = helper.tool_find_remarks(scope='current')
+    assert '3134КМ-2' not in [v['plate'] for v in r['vehicles']] and r['resolved_hidden'] == 1
+    r = helper.tool_find_remarks(scope='current', include_resolved=True)
+    v1 = [v for v in r['vehicles'] if v['plate'] == '3134КМ-2'][0]
+    assert v1['inspections'][0]['resolved'].startswith('устранены')
+    # замечание пришло после отметки — снова неустранённое
+    db.t['inspections'][1]['received_at'] = '2026-10-14T09:00:00Z'
+    helper2 = Assistant(db, 'key', TZ)
+    assert '3134КМ-2' in [v['plate'] for v in helper2.tool_find_remarks(scope='current')['vehicles']]
+
+
+def test_resolution_missing_column_is_ignored(helper, db, monkeypatch):
+    from supa import SupaError
+    real = db.select
+    def select(table, params):
+        if table == 'usage_sessions':
+            raise SupaError(400, 'column usage_sessions.remarks_resolved_at does not exist')
+        return real(table, params)
+    monkeypatch.setattr(db, 'select', select)
+    db.t['inspections'][1]['session_id'] = 's1'
+    assert '3134КМ-2' in [v['plate'] for v in helper.tool_find_remarks(scope='current')['vehicles']]

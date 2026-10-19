@@ -111,6 +111,18 @@ export async function listSessions(vehicleId) {
   const key = s => s.started_at || s.ended_at || s.created_at;
   return rows.sort((a, b) => String(key(b)).localeCompare(String(key(a))));
 }
+// Замечания строк карточки ТС: {session_id: {remark_inspections, unresolved, remarks_resolved_at, ...}}.
+// null — в базе ещё не выполнен скрипт 003_remarks.sql.
+export async function listSessionRemarks(vehicleId) {
+  const { data, error } = await sb.from('v_session_remarks').select('*').eq('vehicle_id', vehicleId);
+  if (error) { console.warn('Замечания недоступны:', error.message); return null; }
+  const out = {};
+  for (const r of data) out[r.session_id] = r;
+  return out;
+}
+export async function setRemarksResolved(sessionId, resolved) {
+  check(await sb.rpc('set_remarks_resolved', { p_session_id: sessionId, p_resolved: resolved }));
+}
 export async function getInspectionDetails(ids) {
   ids = ids.filter(Boolean);
   if (!ids.length) return {};
