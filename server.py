@@ -17,7 +17,7 @@ from sessions import decide, normalize_plate, fmt_km
 from supa import Supa, SupaError, make_thumbnail
 from notify import (Telegram, escape_markdown, compress_image, is_valid_image,
                     analyze_photos_with_ai, compare_inspections_with_ai)
-from assistant import Assistant, AssistantError, analyze_inspection
+from assistant import Assistant, AssistantError, analyze_inspection, pick_model
 
 def env(name, default=''):
     """Значение переменной без случайных пробелов, переводов строк и кавычек по краям."""
@@ -29,6 +29,7 @@ CHAT_ID = env('CHAT_ID')
 SUPABASE_URL = env('SUPABASE_URL').rstrip('/')
 SUPABASE_KEY = env('SUPABASE_KEY')
 ANTHROPIC_KEY = env('ANTHROPIC_KEY')
+ASSISTANT_MODEL, ASSISTANT_MODEL_WARNING = pick_model(env('ASSISTANT_MODEL'))  # модель ИИ-помощника на сайте
 API_TOKEN = env('API_TOKEN')
 TELEGRAM_WEBHOOK_SECRET = env('TELEGRAM_WEBHOOK_SECRET')
 TELEGRAM_API = env('TELEGRAM_API')          # только для тестов: подмена адреса Telegram
@@ -163,6 +164,7 @@ def health_details():
         'PORTAL_URL': PORTAL_URL or 'не задан',
         'ANTHROPIC_KEY': 'задан' if ANTHROPIC_KEY else 'не задан',
         'помощник': assistant,
+        'модель помощника': ASSISTANT_MODEL_WARNING or ASSISTANT_MODEL,
     })
 
 
@@ -416,7 +418,7 @@ def assistant_chat():
     if blocked:
         return blocked
     try:
-        result = Assistant(db, ANTHROPIC_KEY, APP_TZ).chat((request.get_json(silent=True) or {}).get('messages'))
+        result = Assistant(db, ANTHROPIC_KEY, APP_TZ, ASSISTANT_MODEL).chat((request.get_json(silent=True) or {}).get('messages'))
     except Exception as e:
         return assistant_failure(e)
     return jsonify({'ok': True, **result})

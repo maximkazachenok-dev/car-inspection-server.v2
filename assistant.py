@@ -13,7 +13,12 @@ import anthropic
 from notify import analyze_photos_with_ai, image_block
 from sessions import normalize_plate
 
-MODEL = 'claude-opus-5-5'
+DEFAULT_MODEL = 'claude-opus-5-5'
+# Модели, с которыми помощник работает: они понимают все части запроса (инструменты, effort,
+# системные сообщения посреди разговора). Выбирается переменной ASSISTANT_MODEL в Railway.
+SUPPORTED_MODELS = ('claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5', 'claude-opus-5', 'claude-fable-5-1')
+# У этих моделей сервис ИИ сам повторяет вопрос на запасной модели, если основная отказалась отвечать
+FALLBACK_MODELS = ('claude-opus-5-5', 'claude-sonnet-5-5', 'claude-opus-5', 'claude-fable-5-1')
 MAX_STEPS = 10           # обращений к ИИ на один вопрос
 DEADLINE_S = 100         # после этого ИИ отвечает по уже собранным данным (gunicorn ждёт 180 с)
 MAX_HISTORY = 20         # сообщений переписки, которые сайт присылает вместе с вопросом
@@ -28,6 +33,16 @@ WEEKDAYS = ['понедельник', 'вторник', 'среда', 'четв�
 
 class AssistantError(Exception):
     """Ошибка в запросе к помощнику, которую можно показать пользователю."""
+
+
+def pick_model(value):
+    """Модель из настройки ASSISTANT_MODEL: (модель, предупреждение или None). Ошибка в названии не ломает чат."""
+    value = (value or '').strip()
+    if not value:
+        return DEFAULT_MODEL, None
+    if value in SUPPORTED_MODELS:
+        return value, None
+    return DEFAULT_MODEL, f'«{value}» не поддерживается, работает {DEFAULT_MODEL}. Можно: {", ".join(SUPPORTED_MODELS)}'
 
 
 SYSTEM_PROMPT = """Ты — ИИ-помощник администратора сайта «Карточки ТС» транспортной компании. Администратор \
@@ -161,10 +176,11 @@ def analyze_inspection(db, api_key, inspection_id):
 
 
 class Assistant:
-    def __init__(self, db, api_key, tz):
+    def __init__(self, db, api_key, tz, model=DEFAULT_MODEL):
         self.db = db
         self.api_key = api_key
         self.tz = tz
+        self.model = model
         self._drivers = None
         self._vehicles = None
 
@@ -429,18 +445,19 @@ class Assistant:
         started = time.monotonic()
         steps, usage = [], {'input': 0, 'output': 0, 'cache_read': 0}
         finish = False
+        fallback = ({'betas': ['server-side-fallback-2026-07-01'], 'fallbacks': 'default'}
+                    if self.model in FALLBACK_MODELS else {})
         for step in range(MAX_STEPS + 1):
             resp = client.beta.messages.create(
-                model=MODEL, max_tokens=16000, system=self.system(), tools=TOOLS, messages=messages,
+                model=self.model, max_tokens=16000, system=self.system(), tools=TOOLS, messages=messages,
                 tool_choice={'type': 'none'} if finish else {'type': 'auto'},
-                output_config={'effort': 'medium'}, cache_control={'type': 'ephemeral'},
-                betas=['server-side-fallback-2026-07-01'], fallbacks='default')
+                output_config={'effort': 'medium'}, cache_control={'type': 'ephemeral'}, **fallback)
             usage['input'] += resp.usage.input_tokens or 0
             usage['output'] += resp.usage.output_tokens or 0
             usage['cache_read'] += getattr(resp.usage, 'cache_read_input_tokens', 0) or 0
             if resp.stop_reason == 'refusal':
                 return {'answer': 'ИИ отказался отвечать на этот запрос. Попробуйте сформулировать его иначе.',
-                        'steps': steps, 'usage': usage}
+                        'steps': steps, 'usage': usage, 'model': self.model}
             tool_uses = [b for b in resp.content if b.type == 'tool_use']
             if not tool_uses or finish:
                 break
@@ -458,8 +475,9 @@ class Assistant:
         answer = '\n\n'.join(b.text for b in resp.content if b.type == 'text').strip()
         if resp.stop_reason == 'max_tokens':
             answer += '\n\n_(Ответ оборвался: слишком длинный. Уточните вопрос.)_'
-        print(f'Assistant: {len(steps)} steps, usage {usage}, {time.monotonic() - started:.1f}s')
-        return {'answer': answer or 'Пустой ответ ИИ. Повторите вопрос.', 'steps': steps, 'usage': usage}
+        print(f'Assistant ({self.model}): {len(steps)} steps, usage {usage}, {time.monotonic() - started:.1f}s')
+        return {'answer': answer or 'Пустой ответ ИИ. Повторите вопрос.', 'steps': steps, 'usage': usage,
+                'model': self.model}
 
 
 def step_label(name, args):
